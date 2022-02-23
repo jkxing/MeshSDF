@@ -1,21 +1,68 @@
 #!/usr/bin/env python3
 
 import argparse
+from ast import Num
 import json
 import os
 import random
 import time
+from cv2 import VideoWriter
 import torch
 import numpy as np
 
+import math
 import lib
 from lib.workspace import *
 from lib.models.decoder import *
 from lib.utils import *
 from lib.mesh import *
 
-import neural_renderer as nr
+#import neural_renderer as nr
+import nvdiffrast.torch as dr
 import pdb
+
+
+import os
+import sys
+import torch
+import pytorch3d
+import argparse
+import matplotlib.pyplot as plt
+from pytorch3d.utils import ico_sphere
+import numpy as np
+import cv2
+from tqdm import tqdm
+from pytorch3d.io import load_objs_as_meshes, save_obj
+
+from pytorch3d.loss import (
+    chamfer_distance, 
+    mesh_edge_loss, 
+    mesh_laplacian_smoothing, 
+    mesh_normal_consistency,
+)
+from pytorch3d.structures import Meshes
+from pytorch3d.renderer import (
+    look_at_view_transform,
+    OpenGLPerspectiveCameras, 
+    PointLights, 
+    DirectionalLights, 
+    Materials, 
+    RasterizationSettings, 
+    MeshRenderer, 
+    MeshRendererWithFragments,
+    MeshRasterizer,  
+    SoftPhongShader,
+    SoftSilhouetteShader,
+    SoftPhongShader,
+    TexturesVertex
+)
+from pytorch3d.transforms import axis_angle_to_matrix
+
+import sys
+sys.path.append("../PointRenderer")
+sys.path.append("../DenseMatching")
+from LossFunction import PointLossFunction
+from Logger import Logger
 
 AZIMUTH = 45
 ELEVATION = 30
@@ -38,7 +85,7 @@ if __name__ == "__main__":
     arg_parser.add_argument(
         "--iters",
         dest="iterations",
-        default=100,
+        default=1000,
         help="The number of latent code optimization iterations to perform.",
     )
     arg_parser.add_argument(
@@ -50,9 +97,19 @@ if __name__ == "__main__":
     arg_parser.add_argument(
         "--image_resolution",
         dest="image_resolution",
-        default=512,
+        type=int,
+        default=256,
         help="Image resolution for differentiable rendering.",
     )
+    
+    arg_parser.add_argument(
+        "--matcher",
+        dest="matcher",
+        type=str,
+        default="bipart",
+        help="matcher(bipart/spot)",
+    )
+
     arg_parser.add_argument("--fast", default=False, action="store_true" , help="Run faster iso-surface extraction algorithm presented in main paper.")
     args = arg_parser.parse_args()
 
@@ -78,7 +135,6 @@ if __name__ == "__main__":
     saved_model_epoch = saved_model_state["epoch"]
     decoder.load_state_dict(saved_model_state["model_state_dict"])
     decoder = decoder.module.cuda()
-    print(decoder)
 
     optimization_meshes_dir = os.path.join(
         args.experiment_directory, optimizations_subdir
@@ -104,13 +160,14 @@ if __name__ == "__main__":
     elevation = ELEVATION
     camera_distance = CAMERA_DISTANCE
     intrinsic, extrinsic = get_projection(azimuth, elevation, camera_distance, img_w=args.image_resolution, img_h=args.image_resolution)
-
     # set up renderer
     K_cuda = torch.tensor(intrinsic[np.newaxis, :, :].copy()).float().cuda().unsqueeze(0)
     R_cuda = torch.tensor(extrinsic[np.newaxis, 0:3, 0:3].copy()).float().cuda().unsqueeze(0)
     t_cuda = torch.tensor(extrinsic[np.newaxis, np.newaxis, 0:3, 3].copy()).float().cuda().unsqueeze(0)
-    renderer = nr.Renderer(image_size = args.image_resolution, orig_size = args.image_resolution, K=K_cuda, R=R_cuda, t=t_cuda, anti_aliasing=False)
 
+    
+    glctx = dr.RasterizeGLContext()
+    #renderer = nr.Renderer(image_size = args.image_resolution, orig_size = args.image_resolution, K=K_cuda, R=R_cuda, t=t_cuda, anti_aliasing=False)
     verts_target, faces_target, _ , _ = lib.mesh.create_mesh(decoder, latent_target, N=args.resolution, output_mesh = True)
 
     # visualize target stuff
@@ -121,41 +178,98 @@ if __name__ == "__main__":
     image_filename = os.path.join(optimization_meshes_dir, "target.png")
     if not os.path.exists(os.path.dirname(image_filename)):
         os.makedirs(os.path.dirname(image_filename))
-    tgt_images_out, tgt_depth_out, tgt_silhouette_out = renderer(verts_dr, faces_dr, textures_dr)
-    import cv2
-    # sil_vis = tgt_images_out.detach().cpu().numpy()[0]
-    # print(sil_vis.shape)
-    # print(sil_vis[sil_vis>0])
-    # cv2.imshow("test",sil_vis)
-    # cv2.waitKey(0)
-    store_image(image_filename, tgt_images_out, tgt_silhouette_out)
+    num_views=1
+    device="cuda"
+    elev = [30.0]
+    azim = [45.0]
+    lights = PointLights(device=device, location=[[0.0, 0.0, -3.0]])
+    R, T = look_at_view_transform(dist=2.5, elev=elev, azim=azim)
+    cameras = OpenGLPerspectiveCameras(device=device, R=R, T=T)
+    camera = OpenGLPerspectiveCameras(device=device, R=R[None, 0, ...], 
+                                    T=T[None, 0, ...]) 
+    resolution = args.image_resolution
+    raster_settings = RasterizationSettings(
+        image_size=resolution, 
+        blur_radius=0.0, 
+        faces_per_pixel=1, 
+        perspective_correct=False,
+    )
+    renderer_hard = MeshRendererWithFragments(
+        rasterizer=MeshRasterizer(
+            cameras=camera, 
+            raster_settings=raster_settings
+        ),
+        shader=SoftPhongShader(
+            device=device, 
+            cameras=camera,
+            lights=lights
+        )
+    )
+    
+    sigma = 1e-4
+    raster_settings_silhouette = RasterizationSettings(
+        image_size=resolution, 
+        blur_radius=np.log(1. / 1e-4 - 1.)*sigma, 
+        faces_per_pixel=1, 
+    )
 
-    # initialize and visualize initialization
+    # Silhouette renderer 
+    renderer_soft = MeshRenderer(
+        rasterizer=MeshRasterizer(
+            cameras=camera, 
+            raster_settings=raster_settings_silhouette
+        ),
+        shader=SoftSilhouetteShader()
+    ) 
+
+    def renderer(pos, pos_idx, textures, camera, render):
+        mesh = Meshes(verts = pos, faces = pos_idx)
+        verts_tex = torch.full([1, pos.shape[1], 3], 0.5, device=device)
+        mesh.textures = TexturesVertex(verts_features=verts_tex) 
+        meshes = mesh.extend(num_views)
+        target_images, image_fragments = render(meshes, cameras=camera, lights=lights)
+        color_img = target_images[0].detach().cpu().numpy()
+        Logger.log("meshsdf_our",content = color_img)
+        Logger.step(False)
+        return mesh, target_images, image_fragments
+        silhouette_images = renderer_silhouette(meshes, cameras=cameras, lights=lights)
+        haspos, uvw, tri_id, render_pos = point_renderer.render_point_pytorch(image_fragments, mesh)
+        render_pos = point_renderer.point_renderer_pytorch(tri_id, uvw, image_fragments)
+        render_rgb = target_images[haspos>0]
+        print(render_pos.shape,render_rgb.shape)
+        return target_images[0:1],target_images[0:1,...,3],target_images[0:1,...,:3]
+
+
+    tgt_mesh, tgt_images, tgt_image_fragments = renderer(verts_dr, faces_dr, textures_dr, camera, renderer_hard)
     verts, faces, samples, next_indices = lib.mesh.create_mesh(decoder, latent_init, N=args.resolution, output_mesh = True)
     verts_dr = torch.tensor(verts[None, :, :].copy(), dtype=torch.float32, requires_grad = False).cuda()
     faces_dr = torch.tensor(faces[None, :, :].copy()).cuda()
     textures_dr = 0.7*torch.ones(faces_dr.shape[1], 1, 1, 1, 3, dtype=torch.float32).cuda()
     textures_dr = textures_dr.unsqueeze(0)
     image_filename = os.path.join(optimization_meshes_dir, "initialization.png")
-    images_out, _, alpha_out = renderer(verts_dr, faces_dr, textures_dr)
-    store_image(image_filename, images_out, alpha_out)
-
-    lr= 5e-2
+    #store_image(image_filename, images_out, alpha_out)
+    lr= 1e-2
     regl2 = 1000
     decreased_by = 1.5
     adjust_lr_every = 500
     optimizer = torch.optim.Adam([latent_init], lr=lr)
+    
+    import win32api
+    def my_exit(sig, func=None):
+        Logger.exit()
+        print("video saved")
+    win32api.SetConsoleCtrlHandler(my_exit, 1)
+    
 
     print("Starting optimization:")
     decoder.eval()
     best_loss = None
     sigma = None
     images = []
-
+    loss_function = PointLossFunction(num_views=1, res = resolution, matcher=args.matcher, vis=True)
     for e in range(args.iterations):
 
         optimizer.zero_grad()
-
         # first extract iso-surface
         if args.fast:
             verts, faces, samples, next_indices = lib.mesh.create_mesh_optim_fast(samples, next_indices, decoder, latent_init, N=args.resolution)
@@ -171,11 +285,12 @@ if __name__ == "__main__":
         """
 
         textures_dr = 0.7*torch.ones(faces_upstream.shape[0], 1, 1, 1, 3, dtype=torch.float32).cuda()
-        images_out, depth_out, silhouette_out = renderer(xyz_upstream.unsqueeze(0), faces_upstream.unsqueeze(0), textures_dr.unsqueeze(0))
+        mesh, images_out, image_fragments = renderer(xyz_upstream.unsqueeze(0), faces_upstream.unsqueeze(0).int(), textures_dr.unsqueeze(0), camera, renderer_hard)
         
-        loss = torch.mean((images_out-tgt_images_out)**2)
+        #loss =torch.mean((images_out - tgt_images)**2)
+        loss = loss_function(tgt_images[0], images_out, image_fragments, mesh, 0, tgt_mesh, tgt_image_fragments)
         print("Loss at iter {}:".format(e) + ": {}".format(loss.detach().cpu().numpy()))
-
+        
         # now store upstream gradients
         loss.backward()
         dL_dx_i = xyz_upstream.grad
@@ -216,10 +331,8 @@ if __name__ == "__main__":
         textures_dr[:,0,0,0,1] = 1.0-field_faces
         textures_dr[:,0,0,0,2] = 0.7
         textures_dr = textures_dr.unsqueeze(0)
-        images_out, depth_out, alpha_out = renderer(verts_dr, faces_dr, textures_dr)
-        images.append(process_image(images_out, alpha_out))
 
     print("Optimization completed, storing GIF...")
     gif_filename = os.path.join(optimization_meshes_dir, "movie.gif")
-    imageio.mimsave(gif_filename, images)
+    #imageio.mimsave(gif_filename, images)
     print("Done.")

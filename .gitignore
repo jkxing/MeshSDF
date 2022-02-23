@@ -7,3 +7,5 @@
 # .gitignore is already tracked or if you use -f to
 # force-add it if you just created it
 !/.gitignore
+*/__pycache__/
+*/*/__pycache__/
