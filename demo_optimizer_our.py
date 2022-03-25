@@ -59,10 +59,9 @@ from pytorch3d.renderer import (
 from pytorch3d.transforms import axis_angle_to_matrix
 
 import sys
-sys.path.append("../PointRenderer")
-sys.path.append("../DenseMatching")
-from LossFunction import PointLossFunction
-from Logger import Logger
+sys.path.append("../")
+from PointRenderer.LossFunction import PointLossFunction
+from PointRenderer.Logger import Logger
 
 AZIMUTH = 45
 ELEVATION = 30
@@ -241,24 +240,26 @@ if __name__ == "__main__":
 
 
     tgt_mesh, tgt_images, tgt_image_fragments = renderer(verts_dr, faces_dr, textures_dr, camera, renderer_hard)
+    
     verts, faces, samples, next_indices = lib.mesh.create_mesh(decoder, latent_init, N=args.resolution, output_mesh = True)
+    
     verts_dr = torch.tensor(verts[None, :, :].copy(), dtype=torch.float32, requires_grad = False).cuda()
     faces_dr = torch.tensor(faces[None, :, :].copy()).cuda()
     textures_dr = 0.7*torch.ones(faces_dr.shape[1], 1, 1, 1, 3, dtype=torch.float32).cuda()
     textures_dr = textures_dr.unsqueeze(0)
     image_filename = os.path.join(optimization_meshes_dir, "initialization.png")
     #store_image(image_filename, images_out, alpha_out)
-    lr= 1e-2
+    lr= 1e-1
     regl2 = 1000
     decreased_by = 1.5
     adjust_lr_every = 500
     optimizer = torch.optim.Adam([latent_init], lr=lr)
     
-    import win32api
-    def my_exit(sig, func=None):
-        Logger.exit()
-        print("video saved")
-    win32api.SetConsoleCtrlHandler(my_exit, 1)
+    #import win32api
+    #def my_exit(sig, func=None):
+    #    Logger.exit()
+    #    print("video saved")
+    #win32api.SetConsoleCtrlHandler(my_exit, 1)
     
 
     print("Starting optimization:")
@@ -266,7 +267,7 @@ if __name__ == "__main__":
     best_loss = None
     sigma = None
     images = []
-    loss_function = PointLossFunction(num_views=1, res = resolution, matcher=args.matcher, vis=True)
+    loss_function = PointLossFunction(device= torch.device('cuda:0'), renderer = renderer_hard, num_views=1, resolution= resolution, matcher=args.matcher, debug=False, matching_interval=0)
     for e in range(args.iterations):
 
         optimizer.zero_grad()
@@ -288,7 +289,7 @@ if __name__ == "__main__":
         mesh, images_out, image_fragments = renderer(xyz_upstream.unsqueeze(0), faces_upstream.unsqueeze(0).int(), textures_dr.unsqueeze(0), camera, renderer_hard)
         
         #loss =torch.mean((images_out - tgt_images)**2)
-        loss = loss_function(tgt_images[0], images_out, image_fragments, mesh, 0, tgt_mesh, tgt_image_fragments)
+        loss = loss_function(tgt_images[0], mesh, camera, lights, 0)
         print("Loss at iter {}:".format(e) + ": {}".format(loss.detach().cpu().numpy()))
         
         # now store upstream gradients
