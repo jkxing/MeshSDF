@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+import sys
+sys.path.append("../")
 import argparse
 from ast import Num
 import json
@@ -44,6 +46,7 @@ from pytorch3d.structures import Meshes
 from pytorch3d.renderer import (
     look_at_view_transform,
     OpenGLPerspectiveCameras, 
+    camera_position_from_spherical_angles,
     PointLights, 
     DirectionalLights, 
     Materials, 
@@ -58,11 +61,10 @@ from pytorch3d.renderer import (
 )
 from pytorch3d.transforms import axis_angle_to_matrix
 
-import sys
-sys.path.append("../")
-from PointRenderer.LossFunction import PointLossFunction
+from PointRenderer.LossFunction import PointLossFunction2
+from PointRenderer.NvDiffRastRenderer import NVDiffRastFullRenderer
 from PointRenderer.Logger import Logger
-
+import glm
 AZIMUTH = 45
 ELEVATION = 30
 CAMERA_DISTANCE = 2.5
@@ -154,95 +156,58 @@ if __name__ == "__main__":
     latent_target = latent[0]
 
     # select view point
-    azimuth = AZIMUTH
-    elevation = ELEVATION
-    camera_distance = CAMERA_DISTANCE
-    intrinsic, extrinsic = get_projection(azimuth, elevation, camera_distance, img_w=args.image_resolution, img_h=args.image_resolution)
-    # set up renderer
-    K_cuda = torch.tensor(intrinsic[np.newaxis, :, :].copy()).float().cuda().unsqueeze(0)
-    R_cuda = torch.tensor(extrinsic[np.newaxis, 0:3, 0:3].copy()).float().cuda().unsqueeze(0)
-    t_cuda = torch.tensor(extrinsic[np.newaxis, np.newaxis, 0:3, 3].copy()).float().cuda().unsqueeze(0)
-
     
-    glctx = dr.RasterizeGLContext()
-    #renderer = nr.Renderer(image_size = args.image_resolution, orig_size = args.image_resolution, K=K_cuda, R=R_cuda, t=t_cuda, anti_aliasing=False)
-    verts_target, faces_target, _ , _ = lib.mesh.create_mesh(decoder, latent_target, N=args.resolution, output_mesh = True)
 
-    # visualize target stuff
-    verts_dr = torch.tensor(verts_target[None, :, :].copy(), dtype=torch.float32, requires_grad = False).cuda()  # [num_vertices, XYZ] -> [batch_size=1, num_vertices, XYZ]
+    verts_target, faces_target, _ , _ = lib.mesh.create_mesh(decoder, latent_target, N=args.resolution, output_mesh = True)
+    verts_dr = torch.tensor(verts_target[None, :, :].copy(), dtype=torch.float32, requires_grad = False).cuda()  # 
     faces_dr = torch.tensor(faces_target[None, :, :].copy()).cuda()
     textures_dr = 0.7*torch.ones(faces_dr.shape[1], 1, 1, 1, 3, dtype=torch.float32).cuda()
     textures_dr = textures_dr.unsqueeze(0)
-    image_filename = os.path.join(optimization_meshes_dir, "target.png")
-    if not os.path.exists(os.path.dirname(image_filename)):
-        os.makedirs(os.path.dirname(image_filename))
-    num_views=1
+
     device="cuda"
-    elev = [30.0]
-    azim = [45.0]
-    lights = PointLights(device=device, location=[[0.0, 0.0, -3.0]])
-    R, T = look_at_view_transform(dist=2.5, elev=elev, azim=azim)
-    cameras = OpenGLPerspectiveCameras(device=device, R=R, T=T)
-    camera = OpenGLPerspectiveCameras(device=device, R=R[None, 0, ...], 
-                                    T=T[None, 0, ...]) 
-    
-    resolution = args.image_resolution
-    raster_settings = RasterizationSettings(
-        image_size=resolution, 
-        blur_radius=0.0, 
-        faces_per_pixel=1, 
-        perspective_correct=False,
-    )
-    renderer_hard = MeshRendererWithFragments(
-        rasterizer=MeshRasterizer(
-            cameras=camera, 
-            raster_settings=raster_settings
-        ),
-        shader=SoftPhongShader(
-            device=device, 
-            cameras=camera,
-            lights=lights
-        )
-    )
-    
-    sigma = 1e-4
-    raster_settings_silhouette = RasterizationSettings(
-        image_size=resolution, 
-        blur_radius=np.log(1. / 1e-4 - 1.)*sigma, 
-        faces_per_pixel=1, 
-    )
-
-    # Silhouette renderer 
-    renderer_soft = MeshRenderer(
-        rasterizer=MeshRasterizer(
-            cameras=camera, 
-            raster_settings=raster_settings_silhouette
-        ),
-        shader=SoftSilhouetteShader()
-    ) 
-
-    def renderer(pos, pos_idx, textures, camera, render):
+    def build_mesh(pos,pos_idx):
         mesh = Meshes(verts = pos, faces = pos_idx)
         verts_tex = torch.full([1, pos.shape[1], 3], 0.5, device=device)
         mesh.textures = TexturesVertex(verts_features=verts_tex) 
-        meshes = mesh.extend(num_views)
-        target_images, image_fragments = render(meshes, cameras=camera, lights=lights)
-        color_img = target_images[0].detach().cpu().numpy()
-        Logger.log("meshsdf_our",content = color_img)
-        Logger.step(False)
-        return mesh, target_images, image_fragments
-        silhouette_images = renderer_silhouette(meshes, cameras=cameras, lights=lights)
-        haspos, uvw, tri_id, render_pos = point_renderer.render_point_pytorch(image_fragments, mesh)
-        render_pos = point_renderer.point_renderer_pytorch(tri_id, uvw, image_fragments)
-        render_rgb = target_images[haspos>0]
-        print(render_pos.shape,render_rgb.shape)
-        return target_images[0:1],target_images[0:1,...,3],target_images[0:1,...,:3]
+        return [{"model":mesh}]
+    def build_sensors(dist, elev, azim):
+        scene={}
+        center = [0,0,0]
+        width,height=128,128
+        fov = 60
+        znear = 0.1
+        zfar = 1000.0
+        perspective = torch.tensor(np.array(glm.perspective(glm.radians(fov), 1.0, znear, zfar)),device=device)
+        position = torch.tensor(center,device = device)+camera_position_from_spherical_angles(distance=dist, elevation=elev, azimuth=azim, device = device)
+        center=torch.tensor(center,device=device)
+        camera_matrix = np.array([np.array(glm.lookAt(position[i].tolist(), center.tolist(), [0,-1,0])) for i in range(num_views)])
+        camera_matrix = torch.tensor(camera_matrix).to(device)
+        vp = torch.matmul(perspective, camera_matrix).to(device)
+        sensors=[{"position":position,"resolution":(width,height),"matrix":vp,"camera_matrix":camera_matrix,"perspective_matrix":perspective}]
+        return sensors
 
-
-    tgt_mesh, tgt_images, tgt_image_fragments = renderer(verts_dr, faces_dr, textures_dr, camera, renderer_hard)
-    
+    num_views=5
+    dist = 2.5
+    elev = torch.linspace(0, 360, num_views)
+    azim = torch.linspace(-180, 360, num_views)
+    Logger.init(exp_name="MeshSDF") 
+    renderer = NVDiffRastFullRenderer(device=device,simple=True)
+    loss_function = PointLossFunction2(debug=False, resolution=128, matcher="Sinkhorn", device=device, renderer=renderer, num_views=num_views, matching_interval=0, logger=Logger)
+    def show_img(img, stop=False, title=""):
+        img = img.detach().cpu().numpy()
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        cv2.imshow("show_img"+title,img)
+        if stop:
+            cv2.waitKey(0)
+        else:
+            cv2.waitKey(1)
+        
+    verts_dr-=0.3
+    scene={}
+    scene["sensors"]=build_sensors(dist, elev, azim)
+    scene["meshes"]=build_mesh(verts_dr,faces_dr)
+    gt = renderer.render(scene)
     verts, faces, samples, next_indices = lib.mesh.create_mesh(decoder, latent_init, N=args.resolution, output_mesh = True)
-    
     verts_dr = torch.tensor(verts[None, :, :].copy(), dtype=torch.float32, requires_grad = False).cuda()
     faces_dr = torch.tensor(faces[None, :, :].copy()).cuda()
     textures_dr = 0.7*torch.ones(faces_dr.shape[1], 1, 1, 1, 3, dtype=torch.float32).cuda()
@@ -255,21 +220,13 @@ if __name__ == "__main__":
     adjust_lr_every = 500
     optimizer = torch.optim.Adam([latent_init], lr=lr)
     
-    #import win32api
-    #def my_exit(sig, func=None):
-    #    Logger.exit()
-    #    print("video saved")
-    #win32api.SetConsoleCtrlHandler(my_exit, 1)
-    
-
     print("Starting optimization:")
     decoder.eval()
     best_loss = None
     sigma = None
     images = []
-    loss_function = PointLossFunction(device= torch.device('cuda:0'), renderer = renderer_hard, num_views=1, resolution= resolution, matcher=args.matcher, debug=False, matching_interval=0)
-    for e in range(args.iterations):
 
+    for e in range(args.iterations):
         optimizer.zero_grad()
         # first extract iso-surface
         if args.fast:
@@ -284,12 +241,17 @@ if __name__ == "__main__":
         """
         Differentiable Rendering back-propagating to mesh vertices
         """
-
         textures_dr = 0.7*torch.ones(faces_upstream.shape[0], 1, 1, 1, 3, dtype=torch.float32).cuda()
-        mesh, images_out, image_fragments = renderer(xyz_upstream.unsqueeze(0), faces_upstream.unsqueeze(0).int(), textures_dr.unsqueeze(0), camera, renderer_hard)
+        scene["meshes"] = build_mesh(xyz_upstream.unsqueeze(0), faces_upstream.unsqueeze(0).int())
+        selected_view = random.randint(0,num_views-1)
+        if True:
+            loss, render_res = loss_function(gt, iteration=e, scene = scene, view=selected_view)
+        else:
+            render_res = renderer.render(scene, view=selected_view)
+            loss = torch.mean((render_res["images"][0]-gt["images"][selected_view])**2)
         
-        #loss =torch.mean((images_out - tgt_images)**2)
-        loss = loss_function(tgt_images[0], mesh, camera, lights, 0)
+        show_img(gt["images"][selected_view],title="gt")
+        show_img(render_res["images"][0],title="render")
         print("Loss at iter {}:".format(e) + ": {}".format(loss.detach().cpu().numpy()))
         
         # now store upstream gradients
